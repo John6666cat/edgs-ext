@@ -39,16 +39,12 @@ env:
   # pip build isolation would hide the already-installed torch package.
   PIP_NO_BUILD_ISOLATION: "1"
   FORCE_CUDA: "1"
-  CUDA_HOME: "/usr/local/cuda"
   MAX_JOBS: "2"
 
 jobs:
   build-linux-cp310-cu128:
     name: Build Linux cp310 CUDA 12.8 wheels
     runs-on: ubuntu-22.04
-    container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
-      options: --user root
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       TORCH_CUDA_ARCH_LIST: ${{ inputs.arch_list }}
@@ -58,12 +54,40 @@ jobs:
       SIMPLE_KNN_REF: ${{ inputs.simple_knn_ref }}
 
     steps:
-      - name: Install OS packages
+      - name: Show initial disk space
         shell: bash
         run: |
           set -euxo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          df -h
+          du -h -d1 /usr/share /usr/local /opt 2>/dev/null | sort -h | tail -80 || true
+
+      - name: Free disk space on GitHub-hosted runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # This workflow builds CUDA wheels and needs room for CUDA toolkit + torch 2.8.0/cu128.
+          # Remove large preinstalled toolchains that are unrelated to this build.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /opt/microsoft \
+            /opt/pipx || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* || true
+          df -h
+
+      - name: Install Python OS packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates \
             curl \
             git \
@@ -73,7 +97,28 @@ jobs:
             python3.10-venv \
             python3-distutils \
             python3-pip
-          rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /var/lib/apt/lists/*
+          df -h
+
+      - name: Install CUDA Toolkit 12.8
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.0"
+          method: "local"
+          linux-local-args: '["--toolkit"]'
+          log-file-suffix: "ubuntu-22.04-cuda-12.8.0.txt"
+
+      - name: Configure CUDA environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/bin" >> "$GITHUB_PATH"
+          echo "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64" >> "$GITHUB_PATH"
+          df -h
+          nvcc --version
 
       - name: Prepare Python environment
         shell: bash
@@ -81,10 +126,14 @@ jobs:
           set -euxo pipefail
           python3.10 -m venv .venv
           echo "${GITHUB_WORKSPACE}/.venv/bin" >> "${GITHUB_PATH}"
-          .venv/bin/python -m pip install --upgrade pip setuptools wheel packaging ninja
-          .venv/bin/python -m pip install \
+          .venv/bin/python -m pip install --upgrade --no-cache-dir pip setuptools wheel packaging ninja
+          # Only torch is required to build the two CUDA extensions.
+          # torchvision and torchaudio are intentionally not installed to reduce disk usage.
+          .venv/bin/python -m pip install --no-cache-dir \
             --index-url https://download.pytorch.org/whl/cu128 \
-            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+            torch==2.8.0
+          .venv/bin/python -m pip cache purge || true
+          df -h
 
       - name: Clone extension sources
         shell: bash
@@ -120,6 +169,7 @@ jobs:
 
           find sources/diff-gaussian-rasterization -maxdepth 2 -type f | sort | head -80
           find sources/simple-knn -maxdepth 2 -type f | sort | head -80
+          df -h
 
       - name: Build wheels
         shell: bash
@@ -136,6 +186,7 @@ jobs:
           print("torch cuda:", torch.version.cuda)
           print("torch cuda available:", torch.cuda.is_available())
           print("TORCH_CUDA_ARCH_LIST:", os.environ.get("TORCH_CUDA_ARCH_LIST"))
+          print("CUDA_HOME:", os.environ.get("CUDA_HOME"))
           PY
           nvcc --version
 
@@ -144,13 +195,15 @@ jobs:
           python -m pip wheel sources/diff-gaussian-rasterization -w dist --no-deps --no-build-isolation -v
           python -m pip wheel sources/simple-knn -w dist --no-deps --no-build-isolation -v
 
+          python -m pip cache purge || true
           ls -lah dist
+          df -h
 
       - name: Verify wheel imports
         shell: bash
         run: |
           set -euxo pipefail
-          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip install --force-reinstall --no-deps --no-cache-dir dist/*.whl
           python - <<'PY'
           import importlib
           import torch
@@ -193,9 +246,8 @@ jobs:
 
           - Python: 3.10
           - PyTorch: 2.8.0
-          - torchvision: 0.23.0
-          - torchaudio: 2.8.0
-          - CUDA toolkit container: nvidia/cuda:12.8.0-devel-ubuntu22.04
+          - CUDA toolkit: ${{ steps.cuda-toolkit.outputs.cuda }}
+          - CUDA path: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
           - TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}
           - diff_gaussian_rasterization source: ${DIFF_GAUSSIAN_REPO} @ ${DIFF_GAUSSIAN_REF}
           - simple_knn source: ${SIMPLE_KNN_REPO} @ ${SIMPLE_KNN_REF}
