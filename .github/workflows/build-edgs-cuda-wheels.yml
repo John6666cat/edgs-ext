@@ -35,6 +35,9 @@ env:
   PYTHON_VERSION: "3.10"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_CACHE_DIR: "1"
+  # Required because both EDGS CUDA extensions import torch from setup.py.
+  # pip build isolation would hide the already-installed torch package.
+  PIP_NO_BUILD_ISOLATION: "1"
   FORCE_CUDA: "1"
   CUDA_HOME: "/usr/local/cuda"
   MAX_JOBS: "2"
@@ -136,8 +139,10 @@ jobs:
           PY
           nvcc --version
 
-          python -m pip wheel sources/diff-gaussian-rasterization -w dist --no-deps -v
-          python -m pip wheel sources/simple-knn -w dist --no-deps -v
+          # These legacy CUDA extension packages import torch from setup.py.
+          # Therefore, build with --no-build-isolation so setup.py can see the torch 2.8.0 environment installed above.
+          python -m pip wheel sources/diff-gaussian-rasterization -w dist --no-deps --no-build-isolation -v
+          python -m pip wheel sources/simple-knn -w dist --no-deps --no-build-isolation -v
 
           ls -lah dist
 
