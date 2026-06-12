@@ -1,0 +1,212 @@
+name: Build EDGS CUDA Wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag that will later host these wheels"
+        required: true
+        default: "edgs-wheels-torch28-cu128-blackwell-v1"
+      arch_list:
+        description: "TORCH_CUDA_ARCH_LIST for PyTorch CUDAExtension"
+        required: true
+        default: "7.5;8.0;8.6;8.9;9.0;9.0a;12.0+PTX"
+      diff_gaussian_repo:
+        description: "Repository URL for diff_gaussian_rasterization"
+        required: true
+        default: "https://github.com/graphdeco-inria/diff-gaussian-rasterization.git"
+      diff_gaussian_ref:
+        description: "Branch/tag/ref for diff_gaussian_rasterization"
+        required: true
+        default: "dr_aa"
+      simple_knn_repo:
+        description: "Repository URL for simple_knn"
+        required: true
+        default: "https://gitlab.inria.fr/bkerbl/simple-knn.git"
+      simple_knn_ref:
+        description: "Branch/tag/ref for simple_knn"
+        required: true
+        default: "master"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.10"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_CACHE_DIR: "1"
+  FORCE_CUDA: "1"
+  CUDA_HOME: "/usr/local/cuda"
+  MAX_JOBS: "2"
+
+jobs:
+  build-linux-cp310-cu128:
+    name: Build Linux cp310 CUDA 12.8 wheels
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+      options: --user root
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.arch_list }}
+      DIFF_GAUSSIAN_REPO: ${{ inputs.diff_gaussian_repo }}
+      DIFF_GAUSSIAN_REF: ${{ inputs.diff_gaussian_ref }}
+      SIMPLE_KNN_REPO: ${{ inputs.simple_knn_repo }}
+      SIMPLE_KNN_REF: ${{ inputs.simple_knn_ref }}
+
+    steps:
+      - name: Install OS packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            build-essential \
+            python3.10 \
+            python3.10-dev \
+            python3.10-venv \
+            python3-distutils \
+            python3-pip
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Prepare Python environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3.10 -m venv .venv
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "${GITHUB_PATH}"
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel packaging ninja
+          .venv/bin/python -m pip install \
+            --index-url https://download.pytorch.org/whl/cu128 \
+            torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+
+      - name: Clone extension sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p sources
+
+          clone_with_optional_ref() {
+            local repo_url="$1"
+            local repo_ref="$2"
+            local dest="$3"
+
+            if git ls-remote --exit-code --heads "$repo_url" "$repo_ref" >/dev/null 2>&1; then
+              git clone --depth 1 --recursive --branch "$repo_ref" "$repo_url" "$dest"
+            elif git ls-remote --exit-code --tags "$repo_url" "$repo_ref" >/dev/null 2>&1; then
+              git clone --depth 1 --recursive --branch "$repo_ref" "$repo_url" "$dest"
+            else
+              echo "Ref '${repo_ref}' was not found in ${repo_url}; cloning default branch instead."
+              git clone --depth 1 --recursive "$repo_url" "$dest"
+            fi
+          }
+
+          clone_with_optional_ref "$DIFF_GAUSSIAN_REPO" "$DIFF_GAUSSIAN_REF" sources/diff-gaussian-rasterization
+          clone_with_optional_ref "$SIMPLE_KNN_REPO" "$SIMPLE_KNN_REF" sources/simple-knn
+
+          git -C sources/diff-gaussian-rasterization submodule update --init --recursive || true
+
+          if [ ! -d sources/diff-gaussian-rasterization/third_party/glm/glm ]; then
+            rm -rf sources/diff-gaussian-rasterization/third_party/glm
+            mkdir -p sources/diff-gaussian-rasterization/third_party
+            git clone --depth 1 https://github.com/g-truc/glm.git sources/diff-gaussian-rasterization/third_party/glm
+          fi
+
+          find sources/diff-gaussian-rasterization -maxdepth 2 -type f | sort | head -80
+          find sources/simple-knn -maxdepth 2 -type f | sort | head -80
+
+      - name: Build wheels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          rm -f dist/*.whl
+
+          python --version
+          python - <<'PY'
+          import os
+          import torch
+          print("torch:", torch.__version__)
+          print("torch cuda:", torch.version.cuda)
+          print("torch cuda available:", torch.cuda.is_available())
+          print("TORCH_CUDA_ARCH_LIST:", os.environ.get("TORCH_CUDA_ARCH_LIST"))
+          PY
+          nvcc --version
+
+          python -m pip wheel sources/diff-gaussian-rasterization -w dist --no-deps -v
+          python -m pip wheel sources/simple-knn -w dist --no-deps -v
+
+          ls -lah dist
+
+      - name: Verify wheel imports
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python - <<'PY'
+          import importlib
+          import torch
+          print("torch:", torch.__version__)
+          print("torch cuda:", torch.version.cuda)
+          print("torch cuda available:", torch.cuda.is_available())
+          for name in [
+              "diff_gaussian_rasterization",
+              "diff_gaussian_rasterization._C",
+              "simple_knn._C",
+          ]:
+              module = importlib.import_module(name)
+              print("import ok:", name, getattr(module, "__file__", "<builtin>"))
+          PY
+
+      - name: Generate release helper files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > dist/requirements-edgs-cuda-wheels.txt
+
+          for wheel_path in dist/*.whl; do
+            wheel_file="$(basename "$wheel_path")"
+            normalized="${wheel_file//-/_}"
+            if [[ "$normalized" == diff_gaussian_rasterization* ]]; then
+              package="diff_gaussian_rasterization"
+            elif [[ "$normalized" == simple_knn* ]]; then
+              package="simple_knn"
+            else
+              echo "Unknown wheel filename: $wheel_file" >&2
+              exit 1
+            fi
+            echo "${package} @ https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${wheel_file}" >> dist/requirements-edgs-cuda-wheels.txt
+          done
+
+          cat > dist/RELEASE_NOTES.md <<EOF_NOTES
+          # EDGS CUDA wheels
+
+          Target:
+
+          - Python: 3.10
+          - PyTorch: 2.8.0
+          - torchvision: 0.23.0
+          - torchaudio: 2.8.0
+          - CUDA toolkit container: nvidia/cuda:12.8.0-devel-ubuntu22.04
+          - TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}
+          - diff_gaussian_rasterization source: ${DIFF_GAUSSIAN_REPO} @ ${DIFF_GAUSSIAN_REF}
+          - simple_knn source: ${SIMPLE_KNN_REPO} @ ${SIMPLE_KNN_REF}
+
+          Copy the two lines from requirements-edgs-cuda-wheels.txt into the EDGS Space requirements.txt.
+          EOF_NOTES
+
+          cat dist/requirements-edgs-cuda-wheels.txt
+          ls -lah dist
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edgs-cuda-wheels-${{ inputs.release_tag }}
+          path: |
+            dist/*.whl
+            dist/requirements-edgs-cuda-wheels.txt
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
